@@ -24,7 +24,7 @@
 package org.jenkinsci.plugins.gitbucket;
 
 import hudson.Extension;
-import hudson.model.AbstractProject;
+import hudson.model.Job;
 import hudson.model.UnprotectedRootAction;
 import hudson.plugins.git.GitSCM;
 import hudson.scm.SCM;
@@ -46,6 +46,7 @@ import org.acegisecurity.context.SecurityContextHolder;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.URIish;
 import org.jenkinsci.plugins.multiplescms.MultiSCM;
+import java.lang.reflect.Method;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 
@@ -106,8 +107,8 @@ public class GitBucketWebHook implements UnprotectedRootAction {
         Authentication old = SecurityContextHolder.getContext().getAuthentication();
         SecurityContextHolder.getContext().setAuthentication(ACL.SYSTEM);
         try {
-            for (AbstractProject<?, ?> job : Jenkins.getInstance().getAllItems(AbstractProject.class)) {
-                GitBucketPushTrigger trigger = job.getTrigger(GitBucketPushTrigger.class);
+            for (Job<?, ?> job : Jenkins.getInstance().getAllItems(Job.class)) {
+                GitBucketPushTrigger trigger = getTriggerFromJob(job);
                 if (trigger == null) {
                     continue;
                 }
@@ -121,6 +122,53 @@ public class GitBucketWebHook implements UnprotectedRootAction {
         }
     }
 
+    private static GitBucketPushTrigger getTriggerFromJob(Job<?, ?> job) {
+        // Try AbstractProject.getTrigger first
+        try {
+            if (job instanceof hudson.model.AbstractProject) {
+                hudson.model.AbstractProject<?, ?> ap = (hudson.model.AbstractProject<?, ?>) job;
+                return ap.getTrigger(GitBucketPushTrigger.class);
+            }
+        } catch (NoClassDefFoundError e) {
+            // ignore
+        }
+
+        // Try calling getTrigger(Class) reflectively (for ParameterizedJobMixIn.ParameterizedJob)
+        try {
+            Method getTrigger = job.getClass().getMethod("getTrigger", Class.class);
+            Object t = getTrigger.invoke(job, GitBucketPushTrigger.class);
+            if (t instanceof GitBucketPushTrigger) {
+                return (GitBucketPushTrigger) t;
+            }
+        } catch (NoSuchMethodException nsme) {
+            // fall through
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Failed to call getTrigger reflectively: {0}", e.toString());
+        }
+
+        // Try inspecting a getTriggers() map reflectively (for WorkflowJob and other pipeline jobs)
+        try {
+            Method getTriggers = job.getClass().getMethod("getTriggers");
+            Object triggers = getTriggers.invoke(job);
+            if (triggers instanceof java.util.Map) {
+                java.util.Map<?, ?> triggerMap = (java.util.Map<?, ?>) triggers;
+                // Check if the key is the descriptor or the class
+                for (java.util.Map.Entry<?, ?> entry : triggerMap.entrySet()) {
+                    Object value = entry.getValue();
+                    if (value instanceof GitBucketPushTrigger) {
+                        return (GitBucketPushTrigger) value;
+                    }
+                }
+            }
+        } catch (NoSuchMethodException nsme) {
+            // ignore
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Failed to inspect triggers map: {0}", e.toString());
+        }
+
+        return null;
+    }
+
     private String getRepositoryUrl(GitBucketPushRequest req) {
         // current gutbucket returns "clone_url", but old one returs "url",
         // so we check both for compatbility older than gitbucket 3.1
@@ -132,22 +180,154 @@ public class GitBucketWebHook implements UnprotectedRootAction {
 
     private static class RepositoryUrlCollector {
 
-        public static List<String> collect(AbstractProject<?, ?> job) {
+        public static List<String> collect(Job<?, ?> job) {
             List<String> urls = new ArrayList<String>();
-            SCM scm = job.getScm();
-            if (scm instanceof GitSCM) {
-                urls.addAll(collect((GitSCM) scm));
-            } else if (Jenkins.getInstance().getPlugin("multiple-scms") != null
-                    && scm instanceof MultiSCM) {
-                MultiSCM multiSCM = (MultiSCM) scm;
-                List<SCM> scms = multiSCM.getConfiguredSCMs();
-                for (SCM s : scms) {
-                    if (s instanceof GitSCM) {
-                        urls.addAll(collect((GitSCM) s));
+            // For traditional projects (AbstractProject), try to read SCM directly.
+            if (job instanceof hudson.model.AbstractProject) {
+                hudson.model.AbstractProject<?, ?> ap = (hudson.model.AbstractProject<?, ?>) job;
+                SCM scm = ap.getScm();
+                if (scm instanceof GitSCM) {
+                    urls.addAll(collect((GitSCM) scm));
+                } else if (Jenkins.getInstance().getPlugin("multiple-scms") != null
+                        && scm instanceof MultiSCM) {
+                    MultiSCM multiSCM = (MultiSCM) scm;
+                    List<SCM> scms = multiSCM.getConfiguredSCMs();
+                    for (SCM s : scms) {
+                        if (s instanceof GitSCM) {
+                            urls.addAll(collect((GitSCM) s));
+                        }
                     }
+                }
+            } else {
+                // For Pipeline (WorkflowJob), attempt to extract SCM from its definition via reflection
+                try {
+                    Class<?> workflowJobClass = Class.forName("org.jenkinsci.plugins.workflow.job.WorkflowJob");
+                    if (workflowJobClass.isInstance(job)) {
+                        Method getDefinition = workflowJobClass.getMethod("getDefinition");
+                        Object def = getDefinition.invoke(job);
+                        if (def != null) {
+                            try {
+                                Method getScm = def.getClass().getMethod("getScm");
+                                Object scm = getScm.invoke(def);
+                                if (scm instanceof GitSCM) {
+                                    urls.addAll(collect((GitSCM) scm));
+                                }
+                            } catch (NoSuchMethodException nsme) {
+                                // definition has no getScm; ignore
+                            }
+                        }
+
+                        // additionally, check if this job is part of a multibranch project by inspecting its parent
+                        try {
+                            Method getParent = job.getClass().getMethod("getParent");
+                            Object parent = getParent.invoke(job);
+                            if (parent != null) {
+                                try {
+                                    Class<?> mbClass = Class.forName("org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject");
+                                    if (mbClass.isInstance(parent)) {
+                                        // try to get sources via getSCMSources or getSources
+                                        try {
+                                            Method getSources = parent.getClass().getMethod("getSCMSources");
+                                            Object sources = getSources.invoke(parent);
+                                            // sources could be a List of SCMSourceOwners or SCMSource objects
+                                            inspectScmSources(sources, urls);
+                                        } catch (NoSuchMethodException nsme2) {
+                                            try {
+                                                Method getSources2 = parent.getClass().getMethod("getSources");
+                                                Object sources = getSources2.invoke(parent);
+                                                inspectScmSources(sources, urls);
+                                            } catch (NoSuchMethodException nsme3) {
+                                                // give up
+                                            }
+                                        }
+                                    }
+                                } catch (ClassNotFoundException cnfe) {
+                                    // multibranch plugin not installed
+                                }
+                            }
+                        } catch (NoSuchMethodException nsme) {
+                            // ignore
+                        }
+                    }
+                } catch (ClassNotFoundException e) {
+                    // workflow plugin is not installed; nothing to do
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Failed to collect SCM from workflow job: {0}", e.toString());
+                }
+
+                // Fallback: try to read SCMs from the most recent build (useful for inline Pipeline scripts).
+                try {
+                    Method getLastBuild = job.getClass().getMethod("getLastBuild");
+                    Object lastBuild = getLastBuild.invoke(job);
+                    if (lastBuild != null) {
+                        inspectScmFromBuild(lastBuild, urls);
+                    }
+                } catch (NoSuchMethodException nsme) {
+                    // ignore
+                } catch (Exception e) {
+                    LOGGER.log(Level.FINE, "Failed to inspect SCMs from last build: {0}", e.toString());
                 }
             }
             return urls;
+        }
+
+        private static void inspectScmSources(Object sourcesObj, List<String> urls) {
+            if (sourcesObj == null) {
+                return;
+            }
+            try {
+                Iterable iterable = null;
+                if (sourcesObj instanceof Iterable) {
+                    iterable = (Iterable) sourcesObj;
+                } else if (sourcesObj.getClass().isArray()) {
+                    // convert array to iterable
+                    java.util.List list = new java.util.ArrayList();
+                    for (Object o : (Object[]) sourcesObj) {
+                        list.add(o);
+                    }
+                    iterable = list;
+                }
+                if (iterable == null) {
+                    return;
+                }
+
+                for (Object s : iterable) {
+                    if (s == null) continue;
+                    // SCMSource wrappers sometimes hold SCMSourceBinding with 'source' field
+                    try {
+                        // direct SCMSource (e.g., GitSCMSource)
+                        Method getSource = s.getClass().getMethod("getSource");
+                        Object src = getSource.invoke(s);
+                        s = (src != null) ? src : s;
+                    } catch (NoSuchMethodException e) {
+                        // ignore
+                    }
+
+                    // Try common methods on GitSCMSource: getRemote, getRepoOwner, getRepo, etc.
+                    try {
+                        Method getRemote = s.getClass().getMethod("getRemote");
+                        Object remote = getRemote.invoke(s);
+                        if (remote != null) {
+                            urls.add(remote.toString().trim().toLowerCase());
+                            continue;
+                        }
+                    } catch (NoSuchMethodException e) {
+                        // ignore
+                    }
+                    try {
+                        Method getRepo = s.getClass().getMethod("getRepo");
+                        Object repo = getRepo.invoke(s);
+                        if (repo != null) {
+                            urls.add(repo.toString().trim().toLowerCase());
+                            continue;
+                        }
+                    } catch (NoSuchMethodException e) {
+                        // ignore
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.FINE, "Failed to inspect SCM sources: {0}", e.toString());
+            }
         }
 
         private static List<String> collect(GitSCM scm) {
@@ -160,6 +340,42 @@ public class GitBucketWebHook implements UnprotectedRootAction {
                 }
             }
             return urls;
+        }
+
+        private static void inspectScmFromBuild(Object build, List<String> urls) {
+            if (build == null) {
+                return;
+            }
+            try {
+                // Try getSCMs() first (WorkflowRun exposes this).
+                try {
+                    Method getSCMs = build.getClass().getMethod("getSCMs");
+                    Object scmsObj = getSCMs.invoke(build);
+                    if (scmsObj instanceof Iterable) {
+                        for (Object scmObj : (Iterable) scmsObj) {
+                            if (scmObj instanceof GitSCM) {
+                                urls.addAll(collect((GitSCM) scmObj));
+                            }
+                        }
+                        return;
+                    }
+                } catch (NoSuchMethodException nsme) {
+                    // ignore
+                }
+
+                // Fallback: try getSCM().
+                try {
+                    Method getSCM = build.getClass().getMethod("getSCM");
+                    Object scmObj = getSCM.invoke(build);
+                    if (scmObj instanceof GitSCM) {
+                        urls.addAll(collect((GitSCM) scmObj));
+                    }
+                } catch (NoSuchMethodException nsme) {
+                    // ignore
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.FINE, "Failed to inspect SCMs from build: {0}", e.toString());
+            }
         }
     }
 
