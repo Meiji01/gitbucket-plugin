@@ -41,6 +41,7 @@ import hudson.util.StreamTaskListener;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.Charset;
 import java.text.DateFormat;
@@ -81,6 +82,10 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
         getDescriptor().queue.execute(new Runnable() {
             @Override
             public void run() {
+                if (job == null) {
+                    LOGGER.log(Level.WARNING, "Cannot trigger build - job is null");
+                    return;
+                }
                 LOGGER.log(Level.INFO, "{0} triggered.", job.getName());
                 String name = " #" + job.getNextBuildNumber();
                 GitBucketPushCause cause = createGitBucketPushCause(req);
@@ -141,7 +146,7 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
                             }
                         }
                     }
-                } catch (Exception e) {
+                } catch (IllegalAccessException | InvocationTargetException e) {
                     LOGGER.log(Level.WARNING, "Failed to schedule build for job: {0}", e.getMessage());
                     e.printStackTrace();
                     scheduled = false;
@@ -182,8 +187,8 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
                     if (o instanceof Integer) {
                         return (Integer) o;
                     }
-                } catch (Exception e) {
-                    // ignore
+                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+                    // Use default quiet period if reflection fails
                 }
                 return 0;
             }
@@ -215,6 +220,25 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
             } else {
                 return String.format("Started by GitBucket push by %s", pushedBy);
             }
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!super.equals(o)) {
+                return false;
+            }
+            if (!(o instanceof GitBucketPushCause)) {
+                return false;
+            }
+            GitBucketPushCause that = (GitBucketPushCause) o;
+            return pushedBy != null ? pushedBy.equals(that.pushedBy) : that.pushedBy == null;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = super.hashCode();
+            result = 31 * result + (pushedBy != null ? pushedBy.hashCode() : 0);
+            return result;
         }
     }
 
@@ -251,9 +275,10 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
         public void writeLogTo(XMLOutput out) throws IOException {
             java.io.StringWriter sw = new java.io.StringWriter();
             try {
-                new AnnotatedLargeText<GitBucketWebHookPollingAction>(
+                long bytesWritten = new AnnotatedLargeText<GitBucketWebHookPollingAction>(
                         getLogFile(), Charset.defaultCharset(), true, this).writeHtmlTo(0, sw);
                 out.write(sw.toString());
+                LOGGER.log(Level.FINE, "Wrote {0} bytes of log output", bytesWritten);
             } catch (Throwable e) {
                 throw new IOException("Failed to write HTML log", e);
             }
@@ -266,15 +291,18 @@ public class GitBucketPushTrigger extends Trigger<Job<?, ?>> {
     }
 
     public File getLogFile() {
-        try {
-            Method getRoot = job.getClass().getMethod("getRootDir");
-            Object root = getRoot.invoke(job);
-            if (root instanceof File) {
-                return new File((File) root, "gitbucket-polling.log");
+        if (job != null) {
+            try {
+                Method getRoot = job.getClass().getMethod("getRootDir");
+                Object root = getRoot.invoke(job);
+                if (root instanceof File) {
+                    return new File((File) root, "gitbucket-polling.log");
+                }
+            } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+                // Fall back to Jenkins root dir if reflection fails
             }
-        } catch (Exception e) {
-            // ignore and fall back
         }
+        // Default: use Jenkins root directory
         return new File(jenkins.model.Jenkins.getInstance().getRootDir(), "gitbucket-polling.log");
     }
 
